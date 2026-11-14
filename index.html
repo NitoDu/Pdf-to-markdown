@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PDF and EPUB to Markdown</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#2c3e50">
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 16px; line-height: 1.5; color: #222; }
+  h1 { font-size: 1.4rem; }
+  button { font-size: 1rem; padding: 12px 16px; margin: 8px 0; width: 100%; border: 0; border-radius: 8px; background: #2c3e50; color: #fff; }
+  button:disabled { background: #999; }
+  label { display: block; margin: 12px 0 4px; }
+  #status { margin: 10px 0; white-space: pre-wrap; min-height: 1.5em; }
+  #preview { width: 100%; height: 240px; font-family: monospace; font-size: 0.85rem; box-sizing: border-box; }
+  .note { font-size: 0.85rem; color: #555; }
+</style>
+</head>
+<body>
+<h1>PDF and EPUB to Markdown</h1>
+<p class="note">Everything happens on your device. Your files are never uploaded anywhere.</p>
+
+<label for="file">1. Choose a PDF or EPUB book</label>
+<input type="file" id="file" accept=".pdf,.epub,application/pdf,application/epub+zip">
+
+<label><input type="checkbox" id="stripHeaders" checked> Remove repeated headers and page numbers (PDF only)</label>
+
+<button id="convert" disabled>2. Convert</button>
+<div id="status"></div>
+<textarea id="preview" readonly placeholder="A preview of the result appears here."></textarea>
+<button id="save" disabled>3. Save .md file</button>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/turndown/7.2.0/turndown.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+let markdown = "";
+let baseName = "book";
+
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js");
+
+$("file").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  baseName = f.name.replace(/\.(pdf|epub)$/i, "");
+  $("convert").disabled = false;
+  $("save").disabled = true;
+  $("status").textContent = "Selected: " + f.name;
+});
+
+$("convert").addEventListener("click", async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+  $("convert").disabled = true;
+  $("save").disabled = true;
+  try {
+    const buf = await f.arrayBuffer();
+    const isEpub = /\.epub$/i.test(f.name) || f.type === "application/epub+zip";
+    const progress = s => $("status").textContent = s;
+    markdown = isEpub
+      ? await epubToMd(buf, progress)
+      : await pdfToMd(buf, $("stripHeaders").checked, progress);
+    $("preview").value = markdown.length > 5000
+      ? markdown.slice(0, 5000) + "\n\n...(preview shortened, the full file is saved)..."
+      : markdown;
+    $("status").textContent = "Done. " + markdown.length.toLocaleString() + " characters.";
+    $("save").disabled = false;
+  } catch (err) {
+    $("status").textContent = "Error: " + err.message;
+  }
+  $("convert").disabled = false;
+});
+
+$("save").addEventListener("click", async () => {
+  const name = baseName + ".md";
+  const blob = new Blob([markdown], { type: "text/markdown" });
+  try {
+    // Ubuntu / desktop Chrome: a "Save as" window where you choose the folder
+    if (window.showSaveFilePicker) {
+      const handle = await showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: "Markdown", accept: { "text/markdown": [".md"] } }]
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      $("status").textContent = "Saved.";
+      return;
+    }
+    // Android and other browsers: normal download. Chrome saves it to Downloads,
+    // or asks where to save if "Ask where to save each file" is turned on.
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+  } catch (err) {
+    if (err.name !== "AbortError") $("status").textContent = "Save failed: " + err.message;
+  }
+});
+
+/* ---------- PDF ---------- */
+
+async function pdfToMd(buf, stripHeaders, progress) {
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  const pages = [];
+  for (let p = 1; p <= pdf.numPages; p++) {
+    progress("Reading page " + p + " of " + pdf.numPages + "...");
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    pages.push(linesFromItems(content.items));
+  }
+
+  // Typical body text size = median font size in the book
+  const sizes = pages.flat().map(l => l.size).sort((a, b) => a - b);
+  const body = sizes[Math.floor(sizes.length / 2)] || 10;
+
+  if (stripHeaders) removeRepeatedLines(pages);
+
+  const out = [];
+  let para = "";
+  const flush = () => { if (para.trim()) out.push(para.trim()); para = ""; };
+
+  let lastHeading = null; // {size, y, index} of the most recent heading
+
+  for (const lines of pages) {
+    let prevY = null;
+    for (const l of lines) {
+      if (!l.text) continue;
+
+      if (l.size >= body * 1.2 && l.text.length < 120) {
+        // Consecutive big lines (like a multi-line title) become one heading
+        const continues = lastHeading && para === "" &&
+          lastHeading.index === out.length - 1 &&
+          lastHeading.size === l.size &&
+          lastHeading.y - l.y < l.size * 2.2;
+        if (continues) {
+          out[out.length - 1] += " " + l.text;
+        } else {
+          flush();
+          out.push((l.size >= body * 1.6 ? "# " : "## ") + l.text);
+          lastHeading = { size: l.size, index: out.length - 1 };
+        }
+        lastHeading.y = l.y;
+        prevY = null;
+        continue;
+      }
+
+      // A bigger vertical gap, or a list marker, starts a new paragraph
+      const isListItem = /^(\d+\.\s|[❖➢•]|-\s)/.test(l.text);
+      if (prevY !== null && prevY - l.y > body * 1.7) flush();
+      if (isListItem) flush();
+
+      const text = isListItem ? l.text.replace(/^[❖➢•]\s*/, "- ") : l.text;
+      const lastWord = para.slice(0, -1).split(" ").pop() || "";
+      if (para.endsWith("-") && /^[a-z]/.test(text)) {
+        // Keep the hyphen in words like "once-in-a-generation"; drop it for line-end breaks
+        para = lastWord.includes("-") ? para + text : para.slice(0, -1) + text;
+      } else {
+        para += (para ? " " : "") + text;
+      }
+      prevY = l.y;
+    }
+    // A page break only continues the paragraph if the sentence was unfinished
+    if (para && !/[.!?:”"…]$/.test(para.trim())) {
+      // keep going
+    } else {
+      flush();
+    }
+  }
+  flush();
+  return out.join("\n\n");
+}
+
+function linesFromItems(items) {
+  const rows = [];
+  for (const it of items) {
+    if (!it.str) continue;
+    const y = it.transform[5];
+    const size = Math.abs(it.transform[3]) || it.height || 10;
+    let row = rows.find(r => Math.abs(r.y - y) < 2);
+    if (!row) { row = { y, size, parts: [] }; rows.push(row); }
+    row.parts.push({ x: it.transform[4], w: it.width || 0, str: it.str, size });
+    row.size = Math.max(row.size, size);
+  }
+  rows.sort((a, b) => b.y - a.y); // top of the page first
+  return rows.map(r => {
+    r.parts.sort((a, b) => a.x - b.x);
+    let text = "";
+    let endX = null;
+    for (const p of r.parts) {
+      // add a space only when there is a visible gap between text pieces
+      if (endX !== null && p.x - endX > p.size * 0.15 && !text.endsWith(" ")) text += " ";
+      text += p.str;
+      endX = p.x + p.w;
+    }
+    return { y: r.y, size: r.size, text: text.replace(/\s+/g, " ").trim() };
+  });
+}
+
+// Removes lines (like running headers or page numbers) that repeat on many pages
+function removeRepeatedLines(pages) {
+  const counts = new Map();
+  const key = t => t.replace(/\d+/g, "#").toLowerCase();
+  for (const lines of pages) {
+    const seen = new Set(lines.map(l => key(l.text)));
+    for (const k of seen) counts.set(k, (counts.get(k) || 0) + 1);
+  }
+  const limit = pages.length * 0.4;
+  for (const lines of pages) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const t = lines[i].text;
+      if (t.length < 100 && counts.get(key(t)) > limit && pages.length > 4) lines.splice(i, 1);
+    }
+  }
+}
+
+/* ---------- EPUB ---------- */
+
+function normalizePath(path) {
+  const parts = [];
+  for (const seg of path.split("/")) {
+    if (seg === "..") parts.pop();
+    else if (seg && seg !== ".") parts.push(seg);
+  }
+  return parts.join("/");
+}
+
+async function epubToMd(buf, progress) {
+  const zip = await JSZip.loadAsync(buf);
+  const parser = new DOMParser();
+
+  const container = parser.parseFromString(
+    await zip.file("META-INF/container.xml").async("string"), "application/xml");
+  const opfPath = container.querySelector("rootfile").getAttribute("full-path");
+  const opfDir = opfPath.includes("/") ? opfPath.slice(0, opfPath.lastIndexOf("/") + 1) : "";
+
+  const opf = parser.parseFromString(
+    await zip.file(opfPath).async("string"), "application/xml");
+
+  const manifest = {};
+  opf.querySelectorAll("manifest > item").forEach(i => {
+    manifest[i.getAttribute("id")] = i.getAttribute("href");
+  });
+  const spine = [...opf.querySelectorAll("spine > itemref")].map(r => r.getAttribute("idref"));
+
+  const td = new TurndownService({ headingStyle: "atx", bulletListMarker: "-" });
+  const parts = [];
+
+  for (let i = 0; i < spine.length; i++) {
+    const href = manifest[spine[i]];
+    if (!href) continue;
+    progress("Reading chapter " + (i + 1) + " of " + spine.length + "...");
+    const file = zip.file(normalizePath(opfDir + decodeURIComponent(href)));
+    if (!file) continue;
+    const doc = parser.parseFromString(await file.async("string"), "text/html");
+    doc.querySelectorAll("script, style").forEach(n => n.remove());
+    const md = td.turndown(doc.body ? doc.body.innerHTML : "").trim();
+    if (md) parts.push(md);
+  }
+  return parts.join("\n\n");
+}
+</script>
+</body>
+</html>
