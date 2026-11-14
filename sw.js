@@ -1,4 +1,4 @@
-const CACHE = "md-converter-v3";
+const CACHE = "md-converter-v4";
 
 self.addEventListener("install", event => {
   event.waitUntil(

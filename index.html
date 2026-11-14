@@ -248,6 +248,13 @@ async function epubToMd(buf, progress) {
   const spine = [...opf.querySelectorAll("spine > itemref")].map(r => r.getAttribute("idref"));
 
   const td = new TurndownService({ headingStyle: "atx", bulletListMarker: "-" });
+  // Images cannot work in a standalone .md, so drop them
+  td.addRule("noImages", { filter: "img", replacement: () => "" });
+  // Chapter-to-chapter links point at .xhtml files that do not exist in the .md; keep only the text
+  td.addRule("internalLinks", {
+    filter: n => n.nodeName === "A" && /\.x?html/.test(n.getAttribute("href") || ""),
+    replacement: content => content
+  });
   const parts = [];
 
   for (let i = 0; i < spine.length; i++) {
@@ -257,7 +264,7 @@ async function epubToMd(buf, progress) {
     const file = zip.file(normalizePath(opfDir + decodeURIComponent(href)));
     if (!file) continue;
     const doc = parser.parseFromString(await file.async("string"), "text/html");
-    doc.querySelectorAll("script, style").forEach(n => n.remove());
+    doc.querySelectorAll("script, style, nav").forEach(n => n.remove()); // nav = contents and page list
     const md = td.turndown(doc.body ? doc.body.innerHTML : "").trim();
     if (md) parts.push(md);
   }
